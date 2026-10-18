@@ -11738,27 +11738,58 @@ export function issueService(db: Db) {
             eq(issues.executionRunId, checkoutRunId),
           )
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async (tx) => {
+        // Lock in the same order as clearCheckoutRunIfTerminal /
+        // adoptStaleCheckoutRun (issue row, then run row) so the liveness
+        // gate cannot deadlock with the terminal-lock cleanup paths.
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+        );
+        // A 200 checkout must correspond to a durable hold. A terminal or
+        // missing actor run would leave a born-dead checkoutRunId that the
+        // next clearCheckoutRunIfTerminal pass reaps: the response echoes a
+        // hold that no write can ever use. Lock the run row so a concurrent
+        // terminalization serializes with this acquisition instead of racing
+        // it. Mirrors the actorRun liveness gate in adoptStaleCheckoutRun and
+        // adoptUnownedCheckoutRun.
+        if (checkoutRunId) {
+          const actorRun = await tx
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, checkoutRunId))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) {
+            throw conflict("Issue checkout conflict", {
+              reason: "checkout_run_not_live",
+              issueId: id,
+              checkoutRunId,
+              runStatus: actorRun?.status ?? null,
+            });
+          }
+        }
+        return tx
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);

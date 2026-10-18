@@ -573,4 +573,153 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  it("rejects checkout from a terminal run instead of writing a born-dead hold", async () => {
+    // OMN-169 reproduction: a run whose heartbeat_runs row is already terminal
+    // used to receive 200 with checkoutRunId echoed, but the hold was reaped by
+    // clearCheckoutRunIfTerminal on the next request, so every write 409'd.
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Phantom hold issue",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      error: "Issue checkout conflict",
+      details: {
+        reason: "checkout_run_not_live",
+        checkoutRunId: failedRunId,
+        runStatus: "failed",
+      },
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const checkoutActivity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.checked_out"));
+    expect(checkoutActivity).toHaveLength(0);
+  });
+
+  it("rejects checkout from a run with no heartbeat_runs row", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const missingRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Missing run row",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, missingRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      error: "Issue checkout conflict",
+      details: {
+        reason: "checkout_run_not_live",
+        checkoutRunId: missingRunId,
+        runStatus: null,
+      },
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("keeps a live run's checkout hold durable for subsequent writes", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Durable hold issue",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const checkout = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+    expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
+    expect(checkout.body.checkoutRunId).toBe(currentRunId);
+
+    const held = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(held).toEqual({
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+
+    const patch = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Write after checkout" });
+    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+    expect(patch.body.title).toBe("Write after checkout");
+
+    const comment = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "held write" });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+  });
 });
